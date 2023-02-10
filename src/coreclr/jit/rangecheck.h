@@ -637,6 +637,13 @@ public:
     // Compute the range for the op1 and op2 for the given binary operator.
     Range ComputeRangeForBinOp(BasicBlock* block, GenTreeOp* binop, bool monIncreasing DEBUGARG(int indent));
 
+#if defined(FEATURE_HW_INTRINSICS)
+    // Compute the range for the hw intrinsic.
+    Range ComputeRangeForHwIntrinsic(BasicBlock*         block,
+                                     GenTreeHWIntrinsic* hwIntrinsic,
+                                     bool monIncreasing DEBUGARG(int indent));
+#endif // defined(FEATURE_HW_INTRINSICS)
+
     // Merge assertions from AssertionProp's flags, for the corresponding "phiArg."
     // Requires "pRange" to contain range that is computed partially.
     void MergeAssertion(BasicBlock* block, GenTree* phiArg, Range* pRange DEBUGARG(int indent));
@@ -667,6 +674,11 @@ public:
     // Find the def of the "expr" local and recurse on the arguments if any of them involve a
     // calculation that overflows.
     bool DoesVarDefOverflow(GenTreeLclVarCommon* lcl);
+
+#if defined(FEATURE_HW_INTRINSICS)
+    // Does the hw intrinsic overflow? Check recursively.
+    bool DoesHwIntrinsicOverflow(BasicBlock* block, GenTreeHWIntrinsic* hwIntrinsic);
+#endif // defined(FEATURE_HW_INTRINSICS)
 
     bool ComputeDoesOverflow(BasicBlock* block, GenTree* expr);
 

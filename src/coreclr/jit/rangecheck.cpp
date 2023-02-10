@@ -905,30 +905,31 @@ void RangeCheck::MergeAssertion(BasicBlock* block, GenTree* op, Range* pRange DE
 // Compute the range for a binary operation.
 Range RangeCheck::ComputeRangeForBinOp(BasicBlock* block, GenTreeOp* binop, bool monIncreasing DEBUGARG(int indent))
 {
-    assert(binop->OperIs(GT_ADD, GT_AND, GT_RSH, GT_LSH, GT_UMOD, GT_MUL));
+    assert(binop->OperIs(GT_ADD, GT_AND, GT_RSH, GT_LSH, GT_UMOD, GT_MUL, GT_OR, GT_XOR));
 
     GenTree* op1 = binop->gtGetOp1();
     GenTree* op2 = binop->gtGetOp2();
 
     // Special cases for binops where op2 is a constant
-    if (binop->OperIs(GT_AND, GT_RSH, GT_LSH, GT_UMOD))
+    if (binop->OperIs(GT_AND, GT_RSH, GT_LSH, GT_UMOD, GT_OR))
     {
         if (!op2->IsIntCnsFitsInI32())
         {
-            // only cns is supported for op2 at the moment for &,%,<<,>> operators
+            // only cns is supported for op2 at the moment for &,%,<<,>>,| operators
             return Range(Limit::keUnknown);
         }
 
-        int icon = -1;
+        int lLimit = 0;
+        int uLimit = -1;
         if (binop->OperIs(GT_AND))
         {
             // x & cns -> [0..cns]
-            icon = static_cast<int>(op2->AsIntCon()->IconValue());
+            uLimit = static_cast<int>(op2->AsIntCon()->IconValue());
         }
         else if (binop->OperIs(GT_UMOD))
         {
             // x % cns -> [0..cns-1]
-            icon = static_cast<int>(op2->AsIntCon()->IconValue()) - 1;
+            uLimit = static_cast<int>(op2->AsIntCon()->IconValue()) - 1;
         }
         else if (binop->OperIs(GT_RSH, GT_LSH) && op1->OperIs(GT_AND) && op1->AsOp()->gtGetOp2()->IsIntCnsFitsInI32())
         {
@@ -937,25 +938,30 @@ Range RangeCheck::ComputeRangeForBinOp(BasicBlock* block, GenTreeOp* binop, bool
             int icon2 = static_cast<int>(op2->AsIntCon()->IconValue());
             if ((icon1 >= 0) && (icon2 >= 0) && (icon2 < 32))
             {
-                icon = binop->OperIs(GT_RSH) ? (icon1 >> icon2) : (icon1 << icon2);
+                uLimit = binop->OperIs(GT_RSH) ? (icon1 >> icon2) : (icon1 << icon2);
             }
         }
-
-        if (icon >= 0)
+        else if (binop->OperIs(GT_OR))
         {
-            Range range(Limit(Limit::keConstant, 0), Limit(Limit::keConstant, icon));
+            lLimit = static_cast<int>(op2->AsIntCon()->IconValue());
+        }
+
+        if (lLimit > 0 || uLimit >= 0)
+        {
+            Range range(Limit(Limit::keConstant, lLimit),
+                        uLimit >= 0 ? Limit(Limit::keConstant, uLimit) : Limit(Limit::keUndef));
             JITDUMP("Limit range to %s\n", range.ToString(m_pCompiler->getAllocatorDebugOnly()));
             return range;
         }
         // Generalized range computation not implemented for these operators
-        else if (binop->OperIs(GT_AND, GT_UMOD))
+        else if (binop->OperIs(GT_AND, GT_UMOD, GT_OR))
         {
             return Range(Limit::keUnknown);
         }
     }
 
     // other operators are expected to be handled above.
-    assert(binop->OperIs(GT_ADD, GT_MUL, GT_LSH, GT_RSH));
+    assert(binop->OperIs(GT_ADD, GT_MUL, GT_LSH, GT_RSH, GT_XOR));
 
     Range* op1RangeCached = nullptr;
     Range  op1Range       = Limit(Limit::keUndef);
@@ -1032,8 +1038,88 @@ Range RangeCheck::ComputeRangeForBinOp(BasicBlock* block, GenTreeOp* binop, bool
                 op2Range.ToString(m_pCompiler->getAllocatorDebugOnly()),
                 r.ToString(m_pCompiler->getAllocatorDebugOnly()));
     }
+    else if (binop->OperIs(GT_XOR))
+    {
+        r = RangeOps::Merge(op1Range, op2Range, monIncreasing);
+        JITDUMP("BinOp xor ranges %s %s = %s\n", op1Range.ToString(m_pCompiler->getAllocatorDebugOnly()),
+                op2Range.ToString(m_pCompiler->getAllocatorDebugOnly()),
+                r.ToString(m_pCompiler->getAllocatorDebugOnly()));
+    }
     return r;
 }
+
+#if defined(FEATURE_HW_INTRINSICS)
+// Compute the range for a binary operation.
+Range RangeCheck::ComputeRangeForHwIntrinsic(BasicBlock*         block,
+                                             GenTreeHWIntrinsic* hwIntrinsic,
+                                             bool monIncreasing DEBUGARG(int indent))
+{
+    switch (hwIntrinsic->GetHWIntrinsicId())
+    {
+#if defined(TARGET_XARCH)
+        case NI_LZCNT_LeadingZeroCount:
+        case NI_LZCNT_X64_LeadingZeroCount:
+#elif defined(TARGET_ARM64)
+        case NI_AdvSimd_LeadingZeroCount:
+        case NI_ArmBase_LeadingZeroCount:
+        case NI_ArmBase_Arm64_LeadingZeroCount:
+#else
+#error Unsupported platform
+#endif
+        {
+            GenTree* op1 = hwIntrinsic->Op(1);
+
+            Range* op1RangeCached = nullptr;
+            Range  op1Range       = Limit(Limit::keUndef);
+            if (!GetRangeMap()->Lookup(op1, &op1RangeCached))
+            {
+                if (m_pSearchPath->Lookup(op1))
+                {
+                    op1Range = Range(Limit(Limit::keDependent));
+                }
+                else
+                {
+                    op1Range = GetRange(block, op1, monIncreasing DEBUGARG(indent));
+                }
+                MergeAssertion(block, op1, &op1Range DEBUGARG(indent + 1));
+            }
+            else
+            {
+                op1Range = *op1RangeCached;
+            }
+
+            int max;
+            if (op1Range.LowerLimit().IsConstant())
+            {
+                max = static_cast<int>(
+                    BitOperations::LeadingZeroCount(static_cast<uint32_t>(op1Range.LowerLimit().GetConstant())));
+            }
+            else
+            {
+                switch (hwIntrinsic->GetHWIntrinsicId())
+                {
+#if defined(TARGET_XARCH)
+                    case NI_LZCNT_X64_LeadingZeroCount:
+#elif defined(TARGET_ARM64)
+                    case NI_ArmBase_Arm64_LeadingZeroCount:
+#else
+#error Unsupported platform
+#endif
+                        max = 64;
+                        break;
+                    default:
+                        max = 32;
+                        break;
+                }
+            }
+
+            return Range(Limit(Limit::keConstant, 0), Limit(Limit::keConstant, max));
+        }
+        default:
+            return Range(Limit::keUnknown);
+    }
+}
+#endif // defined(FEATURE_HW_INTRINSICS)
 
 //------------------------------------------------------------------------
 // GetRangeFromType: Compute the range from the given type
@@ -1252,6 +1338,28 @@ bool RangeCheck::DoesPhiOverflow(BasicBlock* block, GenTree* expr)
     return false;
 }
 
+#if defined(FEATURE_HW_INTRINSICS)
+bool RangeCheck::DoesHwIntrinsicOverflow(BasicBlock* block, GenTreeHWIntrinsic* hwIntrinsic)
+{
+    switch (hwIntrinsic->GetHWIntrinsicId())
+    {
+#if defined(TARGET_XARCH)
+        case NI_LZCNT_LeadingZeroCount:
+        case NI_LZCNT_X64_LeadingZeroCount:
+#elif defined(TARGET_ARM64)
+        case NI_AdvSimd_LeadingZeroCount:
+        case NI_ArmBase_LeadingZeroCount:
+        case NI_ArmBase_Arm64_LeadingZeroCount:
+#else
+#error Unsupported platform
+#endif
+            return false;
+        default:
+            return true;
+    }
+}
+#endif // defined(FEATURE_HW_INTRINSICS)
+
 bool RangeCheck::DoesOverflow(BasicBlock* block, GenTree* expr)
 {
     bool overflows = false;
@@ -1296,9 +1404,9 @@ bool RangeCheck::ComputeDoesOverflow(BasicBlock* block, GenTree* expr)
     {
         overflows = DoesBinOpOverflow(block, expr->AsOp());
     }
-    // GT_AND, GT_UMOD, GT_LSH and GT_RSH don't overflow
+    // GT_AND, GT_UMOD, GT_LSH and GT_RSH, GT_OR, GT_XOR don't overflow
     // Actually, GT_LSH can overflow so it depends on the analysis done in ComputeRangeForBinOp
-    else if (expr->OperIs(GT_AND, GT_RSH, GT_LSH, GT_UMOD))
+    else if (expr->OperIs(GT_AND, GT_RSH, GT_LSH, GT_UMOD, GT_OR, GT_XOR))
     {
         overflows = false;
     }
@@ -1311,6 +1419,12 @@ bool RangeCheck::ComputeDoesOverflow(BasicBlock* block, GenTree* expr)
     {
         overflows = ComputeDoesOverflow(block, expr->gtGetOp1());
     }
+#if defined(FEATURE_HW_INTRINSICS)
+    else if (expr->OperIs(GT_HWINTRINSIC))
+    {
+        overflows = DoesHwIntrinsicOverflow(block, expr->AsHWIntrinsic());
+    }
+#endif // defined(FEATURE_HW_INTRINSICS)
     GetOverflowMap()->Set(expr, overflows, OverflowMap::Overwrite);
     m_pSearchPath->Remove(expr);
     JITDUMP("[%06d] %s\n", Compiler::dspTreeID(expr), ((overflows) ? "overflows" : "does not overflow"));
@@ -1392,7 +1506,7 @@ Range RangeCheck::ComputeRange(BasicBlock* block, GenTree* expr, bool monIncreas
         MergeAssertion(block, expr, &range DEBUGARG(indent + 1));
     }
     // compute the range for binary operation
-    else if (expr->OperIs(GT_ADD, GT_AND, GT_RSH, GT_LSH, GT_UMOD, GT_MUL))
+    else if (expr->OperIs(GT_ADD, GT_AND, GT_RSH, GT_LSH, GT_UMOD, GT_MUL, GT_OR, GT_XOR))
     {
         range = ComputeRangeForBinOp(block, expr->AsOp(), monIncreasing DEBUGARG(indent + 1));
     }
@@ -1436,6 +1550,13 @@ Range RangeCheck::ComputeRange(BasicBlock* block, GenTree* expr, bool monIncreas
         // with this
         range = GetRangeFromType(castTree->CastToType());
     }
+#if defined(FEATURE_HW_INTRINSICS)
+    else if (expr->OperIs(GT_HWINTRINSIC))
+    {
+        range = ComputeRangeForHwIntrinsic(block, expr->AsHWIntrinsic(), monIncreasing DEBUGARG(indent + 1));
+        JITDUMP("%s\n", range.ToString(m_pCompiler->getAllocatorDebugOnly()));
+    }
+#endif // defined(FEATURE_HW_INTRINSICS)
     else
     {
         // The expression is not recognized, so the result is unknown.
